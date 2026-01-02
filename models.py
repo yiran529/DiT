@@ -79,7 +79,7 @@ class AdaLNCrossAttention(nn.Module):
 
 
 class LatentWeightPredictor(nn.Module):
-    """Predicts continuous importance weights w∈(0,1) for each latent token."""
+    """Predicts continuous importance weights w∈(0,1) for optional latent tokens."""
 
     def __init__(self, hidden_size, num_latents, mlp_hidden=None, temperature=1.0, bias=0.0, target_mean=None):
         super().__init__()
@@ -245,11 +245,12 @@ class DiT(nn.Module):
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
-        num_latents=64,
+        num_latents_basic=32,
+        num_latents_optional=32,
         cross_attn_interval=4,
-        weight_temperature=1.0,
-        weight_bias=0.0,
-        target_weight_mean=None,
+        optional_weight_temperature=1.0,
+        optional_weight_bias=0.0,
+        optional_target_mean=0.5,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -260,11 +261,14 @@ class DiT(nn.Module):
         self.depth = depth
 
         cross_attn_interval = int(cross_attn_interval)
-        num_latents = int(num_latents)
+        num_latents_basic = int(num_latents_basic)
+        num_latents_optional = int(num_latents_optional)
         if cross_attn_interval <= 0:
             raise ValueError("cross_attn_interval must be >= 1")
         self.cross_attn_interval = cross_attn_interval
-        self.num_latents = num_latents
+        self.num_latents_basic = num_latents_basic
+        self.num_latents_optional = num_latents_optional
+        self.num_latents = num_latents_basic + num_latents_optional
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -272,14 +276,18 @@ class DiT(nn.Module):
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
-        self.latent_tokens = nn.Parameter(torch.randn(1, self.num_latents, hidden_size))
-        self.weight_predictor = LatentWeightPredictor(
-            hidden_size,
-            self.num_latents,
-            temperature=weight_temperature,
-            bias=weight_bias,
-            target_mean=target_weight_mean,
-        )
+        self.latent_tokens_basic = nn.Parameter(torch.randn(1, self.num_latents_basic, hidden_size))
+        self.latent_tokens_optional = nn.Parameter(torch.randn(1, self.num_latents_optional, hidden_size))
+        if self.num_latents_optional > 0:
+            self.weight_predictor = LatentWeightPredictor(
+                hidden_size,
+                self.num_latents_optional,
+                temperature=optional_weight_temperature,
+                bias=optional_weight_bias,
+                target_mean=optional_target_mean,
+            )
+        else:
+            self.weight_predictor = None
 
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
@@ -301,7 +309,9 @@ class DiT(nn.Module):
         # Initialize (and freeze) pos_embed by sin-cos embedding:
         pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-        nn.init.normal_(self.latent_tokens, std=0.02)
+        nn.init.normal_(self.latent_tokens_basic, std=0.02)
+        if self.num_latents_optional > 0:
+            nn.init.normal_(self.latent_tokens_optional, std=0.02)
 
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
         w = self.x_embedder.proj.weight.data
@@ -361,11 +371,24 @@ class DiT(nn.Module):
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
-        weights = self.weight_predictor(x, c, t)                # (N, num_latents)
-        self.last_weights = weights.detach()
-        self.last_weight_mean = weights.mean().detach()
-
-        z = self.latent_tokens.expand(x.shape[0], -1, -1) * weights.unsqueeze(-1)
+        z_basic = self.latent_tokens_basic.expand(x.shape[0], -1, -1)
+        if self.weight_predictor is not None:
+            weights_opt = self.weight_predictor(x, c, t)                # (N, num_latents_optional)
+            self.last_optional_weights = weights_opt.detach()
+            self.last_optional_weight_mean = weights_opt.mean().detach()
+            z_optional = self.latent_tokens_optional.expand(x.shape[0], -1, -1) * weights_opt.unsqueeze(-1)
+            # auxiliary sparsity loss toward target mean
+            if self.weight_predictor.target_mean is not None:
+                target = torch.tensor(self.weight_predictor.target_mean, device=weights_opt.device)
+                self.last_optional_aux_loss = (weights_opt.mean(dim=1) - target).pow(2).mean()
+            else:
+                self.last_optional_aux_loss = None
+            z = torch.cat([z_basic, z_optional], dim=1)
+        else:
+            self.last_optional_weights = None
+            self.last_optional_weight_mean = None
+            self.last_optional_aux_loss = None
+            z = z_basic
 
         z = self.cross_attn_x_to_z(z, x, c)
         for idx, block in enumerate(self.blocks):
@@ -497,10 +520,13 @@ def DiT_S_4(**kwargs):
 def DiT_S_8(**kwargs):
     return DiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
 
+def DiT_Tiny_4(**kwargs):
+    return DiT(depth=6, hidden_size=192, patch_size=4, num_heads=4, **kwargs)
 
 DiT_models = {
     'DiT-XL/2': DiT_XL_2,  'DiT-XL/4': DiT_XL_4,  'DiT-XL/8': DiT_XL_8,
     'DiT-L/2':  DiT_L_2,   'DiT-L/4':  DiT_L_4,   'DiT-L/8':  DiT_L_8,
     'DiT-B/2':  DiT_B_2,   'DiT-B/4':  DiT_B_4,   'DiT-B/8':  DiT_B_8,
     'DiT-S/2':  DiT_S_2,   'DiT-S/4':  DiT_S_4,   'DiT-S/8':  DiT_S_8,
+    'DiT-Tiny/4': DiT_Tiny_4,
 }

@@ -1,0 +1,17 @@
+{
+  "results_dir": "results_cifar10",
+  "model": "DiT-B/2",
+  "image_size": 32,
+  "num_classes": 10,
+  "epochs": 200,
+  "batch_size": 64,
+  "seed": 0,
+  "vae": "ema",
+  "num_workers": 4,
+  "log_every": 100,
+  "ckpt_every": 10000,
+  "lr": 0.0001,
+  "classes": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+  "early_stop_patience": 10,
+  "early_stop_min_delta": 0.0
+}
