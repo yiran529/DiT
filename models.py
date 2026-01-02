@@ -20,6 +20,93 @@ def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
+class CrossAttention(nn.Module):
+    """Multi-head cross attention where queries and key/values can differ."""
+
+    def __init__(self, hidden_size, num_heads, qkv_bias=True, attn_drop=0.0, proj_drop=0.0):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = hidden_size // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.q = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
+        self.k = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
+        self.v = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(hidden_size, hidden_size)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def _reshape(self, tensor):
+        B, N, C = tensor.shape
+        tensor = tensor.reshape(B, N, self.num_heads, C // self.num_heads)
+        tensor = tensor.transpose(1, 2)
+        return tensor
+
+    def forward(self, q, k, v):
+        q = self._reshape(self.q(q))
+        k = self._reshape(self.k(k))
+        v = self._reshape(self.v(v))
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        out = attn @ v
+        B, _, Nq, head_dim = out.shape
+        out = out.transpose(1, 2).contiguous().reshape(B, Nq, head_dim * self.num_heads)
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        return out
+
+
+class AdaLNCrossAttention(nn.Module):
+    """AdaLN-Zero modulated cross-attention layer."""
+
+    def __init__(self, hidden_size, num_heads, **block_kwargs):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.cross_attn = CrossAttention(hidden_size, num_heads, **block_kwargs)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 3 * hidden_size, bias=True)
+        )
+
+    def forward(self, q_tokens, kv_tokens, c):
+        shift, scale, gate = self.adaLN_modulation(c).chunk(3, dim=1)
+        q_norm = modulate(self.norm_q(q_tokens), shift, scale)
+        out = self.cross_attn(q_norm, kv_tokens, kv_tokens)
+        return q_tokens + gate.unsqueeze(1) * out
+
+
+class LatentWeightPredictor(nn.Module):
+    """Predicts continuous importance weights w∈(0,1) for each latent token."""
+
+    def __init__(self, hidden_size, num_latents, mlp_hidden=None, temperature=1.0, bias=0.0, target_mean=None):
+        super().__init__()
+        mlp_hidden = mlp_hidden or hidden_size
+        self.temperature = temperature
+        self.bias = bias
+        self.target_mean = target_mean
+
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size * 2, mlp_hidden),
+            nn.SiLU(),
+            nn.Linear(mlp_hidden, num_latents)
+        )
+        self.t_proj = nn.Linear(hidden_size, num_latents)
+
+    def forward(self, x_tokens, c, t):
+        pooled_x = x_tokens.mean(dim=1)
+        inp = torch.cat([pooled_x, c], dim=-1)
+        logits = self.mlp(inp) + self.t_proj(t)
+        if self.target_mean is not None:
+            target = torch.tensor(self.target_mean, device=logits.device)
+            target = torch.clamp(target, 1e-4, 1 - 1e-4)
+            logits = logits + torch.logit(target)
+        weights = torch.sigmoid((logits + self.bias) / self.temperature)
+        return weights
+
+
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
 #################################################################################
@@ -158,6 +245,11 @@ class DiT(nn.Module):
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
+        num_latents=64,
+        cross_attn_interval=4,
+        weight_temperature=1.0,
+        weight_bias=0.0,
+        target_weight_mean=None,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -165,6 +257,14 @@ class DiT(nn.Module):
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
+        self.depth = depth
+
+        cross_attn_interval = int(cross_attn_interval)
+        num_latents = int(num_latents)
+        if cross_attn_interval <= 0:
+            raise ValueError("cross_attn_interval must be >= 1")
+        self.cross_attn_interval = cross_attn_interval
+        self.num_latents = num_latents
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -172,10 +272,20 @@ class DiT(nn.Module):
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+        self.latent_tokens = nn.Parameter(torch.randn(1, self.num_latents, hidden_size))
+        self.weight_predictor = LatentWeightPredictor(
+            hidden_size,
+            self.num_latents,
+            temperature=weight_temperature,
+            bias=weight_bias,
+            target_mean=target_weight_mean,
+        )
 
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
+        self.cross_attn_x_to_z = AdaLNCrossAttention(hidden_size, num_heads)
+        self.cross_attn_z_to_x = AdaLNCrossAttention(hidden_size, num_heads)
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
 
@@ -191,6 +301,7 @@ class DiT(nn.Module):
         # Initialize (and freeze) pos_embed by sin-cos embedding:
         pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        nn.init.normal_(self.latent_tokens, std=0.02)
 
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
         w = self.x_embedder.proj.weight.data
@@ -208,6 +319,9 @@ class DiT(nn.Module):
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        for cross_block in [self.cross_attn_x_to_z, self.cross_attn_z_to_x]:
+            nn.init.constant_(cross_block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(cross_block.adaLN_modulation[-1].bias, 0)
 
         # Zero-out output layers:
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
@@ -230,6 +344,12 @@ class DiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
+    def _latent_exchange(self, x, z, c):
+        """Bidirectional cross-attention between dense (x) and weighted latent (z) tokens."""
+        z_out = self.cross_attn_x_to_z(z, x, c)
+        x_out = self.cross_attn_z_to_x(x, z_out, c)
+        return x_out, z_out
+
     def forward(self, x, t, y):
         """
         Forward pass of DiT.
@@ -241,11 +361,27 @@ class DiT(nn.Module):
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
-        for block in self.blocks:
-            x = block(x, c)                      # (N, T, D)
+        weights = self.weight_predictor(x, c, t)                # (N, num_latents)
+        self.last_weights = weights.detach()
+        self.last_weight_mean = weights.mean().detach()
+
+        z = self.latent_tokens.expand(x.shape[0], -1, -1) * weights.unsqueeze(-1)
+
+        z = self.cross_attn_x_to_z(z, x, c)
+        for idx, block in enumerate(self.blocks):
+            z = block(z, c)
+            if (idx + 1) % self.cross_attn_interval == 0:
+                x, z = self._latent_exchange(x, z, c)
+        if self.depth % self.cross_attn_interval:
+            x, z = self._latent_exchange(x, z, c)
+
+        x = self.cross_attn_z_to_x(x, z, c)
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
+
+    # TODO: Implement compression/recovery pipeline that respects gating to minimize dense->latent transfers.
+    # TODO: Explore grouping z tokens by spatial/semantic regions for finer-grained allocation.
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
         """
