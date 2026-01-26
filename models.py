@@ -28,6 +28,7 @@ class CrossAttention(nn.Module):
         self.num_heads = num_heads
         head_dim = hidden_size // num_heads
         self.scale = head_dim ** -0.5
+        self.sigma = nn.Parameter(torch.tensor(0.5))
 
         self.q = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
         self.k = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
@@ -42,12 +43,18 @@ class CrossAttention(nn.Module):
         tensor = tensor.transpose(1, 2)
         return tensor
 
-    def forward(self, q, k, v):
+    def forward(self, q, k, v, q_pos=None, kv_pos=None):
         q = self._reshape(self.q(q))
         k = self._reshape(self.k(k))
         v = self._reshape(self.v(v))
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
+        if q_pos is not None and kv_pos is not None:
+            diff = q_pos.unsqueeze(2) - kv_pos.unsqueeze(1)
+            d2 = (diff ** 2).sum(dim=-1)
+            sigma2 = self.sigma * self.sigma + 1e-6
+            bias = -d2 / (2.0 * sigma2)
+            attn = attn + bias.unsqueeze(1)
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
@@ -71,10 +78,10 @@ class AdaLNCrossAttention(nn.Module):
             nn.Linear(hidden_size, 3 * hidden_size, bias=True)
         )
 
-    def forward(self, q_tokens, kv_tokens, c):
+    def forward(self, q_tokens, kv_tokens, c, q_pos=None, kv_pos=None):
         shift, scale, gate = self.adaLN_modulation(c).chunk(3, dim=1)
         q_norm = modulate(self.norm_q(q_tokens), shift, scale)
-        out = self.cross_attn(q_norm, kv_tokens, kv_tokens)
+        out = self.cross_attn(q_norm, kv_tokens, kv_tokens, q_pos=q_pos, kv_pos=kv_pos)
         return q_tokens + gate.unsqueeze(1) * out
 
 
@@ -278,6 +285,13 @@ class DiT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
         self.latent_tokens_basic = nn.Parameter(torch.randn(1, self.num_latents_basic, hidden_size))
         self.latent_tokens_optional = nn.Parameter(torch.randn(1, self.num_latents_optional, hidden_size))
+        self.latent_anchor_base_raw = nn.Parameter(torch.zeros(self.num_latents, 2))
+        self.latent_anchor_offset_mlp = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, self.num_latents * 2),
+        )
+        self.latent_anchor_offset_scale = 0.15
         if self.num_latents_optional > 0:
             self.weight_predictor = LatentWeightPredictor(
                 hidden_size,
@@ -294,6 +308,11 @@ class DiT(nn.Module):
         ])
         self.cross_attn_x_to_z = AdaLNCrossAttention(hidden_size, num_heads)
         self.cross_attn_z_to_x = AdaLNCrossAttention(hidden_size, num_heads)
+        self.film_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size * 2, 3 * hidden_size + 1, bias=True)
+        )
+        self.film_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
 
@@ -332,6 +351,8 @@ class DiT(nn.Module):
         for cross_block in [self.cross_attn_x_to_z, self.cross_attn_z_to_x]:
             nn.init.constant_(cross_block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(cross_block.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.film_modulation[-1].weight, 0)
+        nn.init.constant_(self.film_modulation[-1].bias, 0)
 
         # Zero-out output layers:
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
@@ -354,11 +375,41 @@ class DiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
+    def film_modulate_x(self, x, z, c):
+        z_pool = z.mean(dim=1)
+        inp = torch.cat([z_pool, c], dim=-1)
+        gamma_beta_gate = self.film_modulation(inp)
+        gamma, beta, gate = torch.split(gamma_beta_gate, [self.film_norm.normalized_shape[0],
+                                                         self.film_norm.normalized_shape[0], 1], dim=-1)
+        x_norm = self.film_norm(x)
+        return x + gate.unsqueeze(1) * (gamma.unsqueeze(1) * x_norm + beta.unsqueeze(1))
+
+    def _get_x_patch_positions(self, x):
+        num_tokens = x.shape[1]
+        grid_size = int(num_tokens ** 0.5)
+        if grid_size * grid_size != num_tokens:
+            raise ValueError(f"Expected square token grid, got {num_tokens} tokens.")
+        coords = torch.linspace(-1.0, 1.0, steps=grid_size, device=x.device, dtype=x.dtype)
+        grid_y, grid_x = torch.meshgrid(coords, coords, indexing="ij")
+        pos = torch.stack([grid_x, grid_y], dim=-1).view(num_tokens, 2)
+        return pos.unsqueeze(0).expand(x.shape[0], -1, -1)
+
     def _latent_exchange(self, x, z, c):
-        """Bidirectional cross-attention between dense (x) and weighted latent (z) tokens."""
-        z_out = self.cross_attn_x_to_z(z, x, c)
-        x_out = self.cross_attn_z_to_x(x, z_out, c)
-        return x_out, z_out
+        """Cross-attention from x to z, then FiLM-style modulation of x."""
+        q_pos = self.compute_latent_anchors(x, c)
+        kv_pos = self._get_x_patch_positions(x)
+        z_out = self.cross_attn_x_to_z(z, x, c, q_pos=q_pos, kv_pos=kv_pos)
+        x = self.film_modulate_x(x, z_out, c)
+        return x, z_out
+
+    def compute_latent_anchors(self, x, c):
+        pooled_x = x.mean(dim=1)
+        inp = torch.cat([pooled_x, c], dim=-1)
+        base = torch.tanh(self.latent_anchor_base_raw)
+        offset = self.latent_anchor_offset_scale * torch.tanh(self.latent_anchor_offset_mlp(inp))
+        offset = offset.view(x.shape[0], self.num_latents, 2)
+        anchors = base.unsqueeze(0) + offset
+        return torch.clamp(anchors, -1.0, 1.0)
 
     def forward(self, x, t, y):
         """
@@ -398,7 +449,7 @@ class DiT(nn.Module):
         if self.depth % self.cross_attn_interval:
             x, z = self._latent_exchange(x, z, c)
 
-        x = self.cross_attn_z_to_x(x, z, c)
+        x = self.film_modulate_x(x, z, c)
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
