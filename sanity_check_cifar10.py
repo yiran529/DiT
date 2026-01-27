@@ -7,6 +7,7 @@ import logging
 import os
 
 import torch
+from torch.utils.data import DataLoader, TensorDataset
 from torchvision import transforms
 from torchvision.datasets import CIFAR10
 
@@ -23,6 +24,15 @@ def create_logger(log_dir: str):
         handlers=[logging.StreamHandler(), logging.FileHandler(os.path.join(log_dir, "log.txt"))],
     )
     return logging.getLogger(__name__)
+
+
+def compute_grad_norm(parameters):
+    total = 0.0
+    for param in parameters:
+        if param.grad is not None:
+            grad = param.grad.detach()
+            total += grad.norm(2).item() ** 2
+    return total ** 0.5 if total > 0 else 0.0
 
 
 def find_one_per_class(dataset, classes):
@@ -55,7 +65,7 @@ def main(args):
         optional_weight_temperature=args.optional_weight_temperature,
         optional_weight_bias=args.optional_weight_bias,
         optional_target_mean=args.optional_target_mean,
-        patch_size=args.patch_size,
+        # patch_size=args.patch_size,
     ).to(device)
     diffusion = create_diffusion(timestep_respacing="")
 
@@ -74,45 +84,92 @@ def main(args):
 
     indices = find_one_per_class(dataset, classes)
     images, labels = zip(*[dataset[i] for i in indices])
-    x = torch.stack(images, dim=0).to(device)
-    y = torch.tensor(labels, device=device)
-
-    t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
-    model_kwargs = dict(y=y)
-    loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
-    loss = loss_dict["loss"].mean()
-    aux = getattr(model, "last_optional_aux_loss", None)
-    if aux is not None:
-        loss = loss + args.optional_aux_weight * aux
+    images_tensor = torch.stack(images, dim=0)
+    labels_tensor = torch.tensor(labels)
+    data_loader = DataLoader(
+        TensorDataset(images_tensor, labels_tensor),
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=False,
+    )
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0)
-    opt.zero_grad()
-    loss.backward()
-    opt.step()
-
     logger.info(
-        f"Sanity check complete. classes={classes}, loss={loss.item():.4f}, "
-        f"weight_mean={getattr(model, 'last_optional_weight_mean', torch.tensor(float('nan')))}"
+        f"Training for {args.epochs} epochs on {len(images_tensor)} samples (classes={classes})."
+        f"config: {args}"
     )
+
+    for epoch in range(args.epochs):
+        epoch_loss = 0.0
+        batch_count = 0
+        last_grad_norm = 0.0
+        for batch_x, batch_y in data_loader:
+            batch_count += 1
+            x = batch_x.to(device)
+            y = batch_y.to(device)
+            t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
+            model_kwargs = dict(y=y)
+            loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+            loss = loss_dict["loss"].mean()
+            aux = getattr(model, "last_optional_aux_loss", None)
+            if aux is not None:
+                loss = loss + args.optional_aux_weight * aux
+
+            opt.zero_grad()
+            loss.backward()
+            last_grad_norm = compute_grad_norm(model.parameters())
+            opt.step()
+
+            epoch_loss += loss.item()
+
+        if not (epoch % 10 == 0 or epoch == args.epochs - 1): 
+            continue
+
+        avg_loss = epoch_loss / max(batch_count, 1)
+        weight_mean = getattr(model, "last_optional_weight_mean", None)
+        if isinstance(weight_mean, torch.Tensor):
+            weight_mean_val = float(weight_mean.detach().cpu().item())
+        elif weight_mean is None:
+            weight_mean_val = float('nan')
+        else:
+            weight_mean_val = float(weight_mean)
+        aux_val = getattr(model, "last_optional_aux_loss", None)
+        aux_log = float('nan') if aux_val is None else float(aux_val.detach().cpu().item())
+        logger.info(
+            f"Epoch {epoch + 1}/{args.epochs}: loss={avg_loss:.4f}, grad_norm={last_grad_norm:.4f}, "
+            f"weight_mean={weight_mean_val:.4f}, aux={aux_log:.4f}"
+        )
+
+    ckpt_path = os.path.join(args.results_dir, f"ckpt_sanity_check.pt")
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "args": vars(args),
+        },
+        ckpt_path,
+    )
+    logger.info(f"Saved checkpoint to {ckpt_path}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, required=True, help="CIFAR-10 root directory")
     parser.add_argument("--results-dir", type=str, default="results_cifar10_sanity")
-    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-B/2")
+    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-Tiny/4")
     parser.add_argument("--image-size", type=int, default=32)
     parser.add_argument("--num-classes", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--patch-size", type=int, default=2)
+    parser.add_argument("--patch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--num-latents-basic", type=int, default=32)
-    parser.add_argument("--num-latents-optional", type=int, default=32)
+    parser.add_argument("--epochs", type=int, default=3000, help="Number of training epochs.")
+    parser.add_argument("--batch-size", type=int, default=2, help="Mini-batch size for the sanity loop.")
+    parser.add_argument("--num-latents-basic", type=int, default=24)
+    parser.add_argument("--num-latents-optional", type=int, default=8)
     parser.add_argument("--cross-attn-interval", type=int, default=4)
     parser.add_argument("--optional-weight-temperature", type=float, default=1.0)
     parser.add_argument("--optional-weight-bias", type=float, default=0.0)
     parser.add_argument("--optional-target-mean", type=float, default=0.5)
-    parser.add_argument("--optional-aux-weight", type=float, default=0.1)
+    parser.add_argument("--optional-aux-weight", type=float, default=0.01)
     parser.add_argument(
         "--classes",
         type=int,

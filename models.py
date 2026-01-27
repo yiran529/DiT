@@ -244,7 +244,7 @@ class DiT(nn.Module):
         self,
         input_size=32,
         patch_size=2,
-        in_channels=4,
+        in_channels=3,
         hidden_size=1152,
         depth=28,
         num_heads=16,
@@ -310,7 +310,7 @@ class DiT(nn.Module):
         self.cross_attn_z_to_x = AdaLNCrossAttention(hidden_size, num_heads)
         self.film_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size * 2, 3 * hidden_size + 1, bias=True)
+            nn.Linear(hidden_size * 2, 2 * hidden_size + 1, bias=True)
         )
         self.film_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
@@ -422,6 +422,7 @@ class DiT(nn.Module):
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
+        
         z_basic = self.latent_tokens_basic.expand(x.shape[0], -1, -1)
         if self.weight_predictor is not None:
             weights_opt = self.weight_predictor(x, c, t)                # (N, num_latents_optional)
