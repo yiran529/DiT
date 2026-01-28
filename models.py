@@ -23,18 +23,22 @@ def modulate(x, shift, scale):
 class CrossAttention(nn.Module):
     """Multi-head cross attention where queries and key/values can differ."""
 
-    def __init__(self, hidden_size, num_heads, qkv_bias=True, attn_drop=0.0, proj_drop=0.0):
+    def __init__(self, hidden_size, num_heads, qkv_bias=True, attn_drop=0.0, proj_drop=0.0, attn_dim=None, out_dim=None):
         super().__init__()
         self.num_heads = num_heads
-        head_dim = hidden_size // num_heads
+        self.inner_dim = attn_dim or hidden_size
+        if self.inner_dim % num_heads != 0:
+            raise ValueError("attn_dim must be divisible by num_heads")
+        head_dim = self.inner_dim // num_heads
         self.scale = head_dim ** -0.5
         self.sigma = nn.Parameter(torch.tensor(0.5))
+        self.out_dim = out_dim or hidden_size
 
-        self.q = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
-        self.k = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
-        self.v = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
+        self.q = nn.Linear(hidden_size, self.inner_dim, bias=qkv_bias)
+        self.k = nn.Linear(hidden_size, self.inner_dim, bias=qkv_bias)
+        self.v = nn.Linear(hidden_size, self.inner_dim, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(hidden_size, hidden_size)
+        self.proj = nn.Linear(self.inner_dim, self.out_dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
     def _reshape(self, tensor):
@@ -283,15 +287,42 @@ class DiT(nn.Module):
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
-        self.latent_tokens_basic = nn.Parameter(torch.randn(1, self.num_latents_basic, hidden_size))
-        self.latent_tokens_optional = nn.Parameter(torch.randn(1, self.num_latents_optional, hidden_size))
-        self.latent_anchor_base_raw = nn.Parameter(torch.zeros(self.num_latents, 2))
-        self.latent_anchor_offset_mlp = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, self.num_latents * 2),
+        
+        self.register_buffer(
+            "latent_tokens_basic",
+            torch.empty(1, self.num_latents_basic, hidden_size).uniform_(-1.0, 1.0),
+            persistent=False,
         )
-        self.latent_anchor_offset_scale = 0.15
+        self.register_buffer(
+            "latent_tokens_optional",
+            torch.empty(1, self.num_latents_optional, hidden_size).uniform_(-1.0, 1.0),
+            persistent=False,
+        )
+
+        def _fixed_base_anchors(num_latents, device, dtype):
+            if num_latents <= 0:
+                return torch.zeros((0, 2), device=device, dtype=dtype)
+            h = int(math.floor(math.sqrt(num_latents)))
+            w = int(math.ceil(num_latents / h))
+            m = 0.9
+            xs = torch.linspace(-m, m, steps=w, device=device, dtype=dtype)
+            ys = torch.linspace(-m, m, steps=h, device=device, dtype=dtype)
+            grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+            grid = torch.stack([grid_x, grid_y], dim=-1).view(-1, 2)
+            p = grid.shape[0]
+            idx = (torch.arange(num_latents, device=device) * p // num_latents).long()
+            return grid[idx]
+
+        base_basic = _fixed_base_anchors(self.num_latents_basic, device=torch.device("cpu"), dtype=torch.float32)
+        base_optional = _fixed_base_anchors(self.num_latents_optional, device=torch.device("cpu"), dtype=torch.float32)
+        base_all = torch.cat([base_basic, base_optional], dim=0) if base_optional.numel() > 0 else base_basic
+        self.register_buffer("latent_anchor_base_raw", base_all, persistent=False)
+        
+        attn_dim = hidden_size // 4
+        self.latent_anchor_offset_attn = CrossAttention(hidden_size, 4, attn_dim=attn_dim, out_dim=attn_dim)
+        self.latent_anchor_offset_act = nn.SiLU()
+        self.latent_anchor_offset_proj = nn.Linear(attn_dim, 2)
+        self.latent_anchor_offset_scale = 0.5
         if self.num_latents_optional > 0:
             self.weight_predictor = LatentWeightPredictor(
                 hidden_size,
@@ -328,10 +359,6 @@ class DiT(nn.Module):
         # Initialize (and freeze) pos_embed by sin-cos embedding:
         pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-        nn.init.normal_(self.latent_tokens_basic, std=0.02)
-        if self.num_latents_optional > 0:
-            nn.init.normal_(self.latent_tokens_optional, std=0.02)
-
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
         w = self.x_embedder.proj.weight.data
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
@@ -384,30 +411,33 @@ class DiT(nn.Module):
         x_norm = self.film_norm(x)
         return x + gate.unsqueeze(1) * (gamma.unsqueeze(1) * x_norm + beta.unsqueeze(1))
 
-    def _get_x_patch_positions(self, x):
-        num_tokens = x.shape[1]
+
+    @staticmethod
+    def _make_patch_positions(num_tokens, device, dtype):
         grid_size = int(num_tokens ** 0.5)
         if grid_size * grid_size != num_tokens:
             raise ValueError(f"Expected square token grid, got {num_tokens} tokens.")
-        coords = torch.linspace(-1.0, 1.0, steps=grid_size, device=x.device, dtype=x.dtype)
+        coords = (torch.arange(grid_size, device=device, dtype=dtype) + 0.5) / grid_size
+        coords = coords * 2.0 - 1.0
         grid_y, grid_x = torch.meshgrid(coords, coords, indexing="ij")
-        pos = torch.stack([grid_x, grid_y], dim=-1).view(num_tokens, 2)
+        return torch.stack([grid_x, grid_y], dim=-1).view(num_tokens, 2)
+    
+    def _get_x_patch_positions(self, x):
+        pos = self._make_patch_positions(x.shape[1], device=x.device, dtype=x.dtype)
         return pos.unsqueeze(0).expand(x.shape[0], -1, -1)
 
-    def _latent_exchange(self, x, z, c):
+    def _latent_exchange(self, x, z, c, x_pos, z_pos):
         """Cross-attention from x to z, then FiLM-style modulation of x."""
-        q_pos = self.compute_latent_anchors(x, c)
-        kv_pos = self._get_x_patch_positions(x)
-        z_out = self.cross_attn_x_to_z(z, x, c, q_pos=q_pos, kv_pos=kv_pos)
+        z_out = self.cross_attn_x_to_z(z, x, c, q_pos=z_pos, kv_pos=x_pos)
         x = self.film_modulate_x(x, z_out, c)
         return x, z_out
 
-    def compute_latent_anchors(self, x, c):
-        pooled_x = x.mean(dim=1)
-        inp = torch.cat([pooled_x, c], dim=-1)
-        base = torch.tanh(self.latent_anchor_base_raw)
-        offset = self.latent_anchor_offset_scale * torch.tanh(self.latent_anchor_offset_mlp(inp))
-        offset = offset.view(x.shape[0], self.num_latents, 2)
+    def _compute_latent_anchors(self, x, z):
+        base = torch.tanh(self.latent_anchor_base_raw).to(dtype=x.dtype, device=x.device)
+        attn_out = self.latent_anchor_offset_attn(z, x, x)
+        offset = self.latent_anchor_offset_act(attn_out)
+        offset = self.latent_anchor_offset_proj(offset)
+        offset = self.latent_anchor_offset_scale * torch.tanh(offset)
         anchors = base.unsqueeze(0) + offset
         return torch.clamp(anchors, -1.0, 1.0)
 
@@ -442,13 +472,15 @@ class DiT(nn.Module):
             self.last_optional_aux_loss = None
             z = z_basic
 
-        z = self.cross_attn_x_to_z(z, x, c)
+        x_pos = self._get_x_patch_positions(x)
+        z_pos = self._compute_latent_anchors(x, z)
+        z = self.cross_attn_x_to_z(z, x, c, q_pos=z_pos, kv_pos=x_pos)
         for idx, block in enumerate(self.blocks):
             z = block(z, c)
             if (idx + 1) % self.cross_attn_interval == 0:
-                x, z = self._latent_exchange(x, z, c)
+                x, z = self._latent_exchange(x, z, c, x_pos=x_pos, z_pos=z_pos)
         if self.depth % self.cross_attn_interval:
-            x, z = self._latent_exchange(x, z, c)
+            x, z = self._latent_exchange(x, z, c, x_pos=x_pos, z_pos=z_pos)
 
         x = self.film_modulate_x(x, z, c)
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
